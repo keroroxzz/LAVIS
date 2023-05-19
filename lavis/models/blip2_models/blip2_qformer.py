@@ -54,20 +54,29 @@ class Blip2Qformer(Blip2Base):
         cross_attention_freq=2,
         embed_dim=256,
         max_txt_len=32,
+        visual_encoder=None,
+        ln_vision=None,
     ):
         super().__init__()
 
         self.tokenizer = self.init_tokenizer()
 
-        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
-            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        )
+        if visual_encoder is None:
+            self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+                vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+            )
+        else:
+            print("Use shared visual encoder")
+            self.visual_encoder = visual_encoder
+            self.ln_vision = ln_vision
+            
         if freeze_vit:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
             self.visual_encoder = self.visual_encoder.eval()
             self.visual_encoder.train = disabled_train
             logging.info("freeze vision encoder")
+        print("Qformer")
         self.Qformer, self.query_tokens = self.init_Qformer(
             num_query_token, self.visual_encoder.num_features, cross_attention_freq
         )

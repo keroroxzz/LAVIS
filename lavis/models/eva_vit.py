@@ -321,33 +321,30 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
-        x = self.patch_embed(x)
-        batch_size, seq_len, _ = x.size()
+    def forward_features(self, x, beg_layer=None):
 
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_tokens, x), dim=1)
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
-        x = self.pos_drop(x)
+        if beg_layer is None:
+            x = self.patch_embed(x)
+            batch_size, seq_len, _ = x.size()
+
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+            x = torch.cat((cls_tokens, x), dim=1)
+            if self.pos_embed is not None:
+                x = x + self.pos_embed
+            x = self.pos_drop(x)
 
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
-        for blk in self.blocks:
+
+        blks = self.blocks if beg_layer is None else self.blocks[beg_layer:]
+        for blk in blks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x, rel_pos_bias)
             else:
                 x = blk(x, rel_pos_bias)
         return x
-#         x = self.norm(x)
 
-#         if self.fc_norm is not None:
-#             t = x[:, 1:, :]
-#             return self.fc_norm(t.mean(1))
-#         else:
-#             return x[:, 0]
-
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, beg_layer=None):
+        x = self.forward_features(x, beg_layer=beg_layer)
 #         x = self.head(x)
         return x
 

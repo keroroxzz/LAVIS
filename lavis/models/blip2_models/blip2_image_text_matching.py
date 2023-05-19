@@ -36,6 +36,8 @@ class Blip2ITM(Blip2Qformer):
         cross_attention_freq=2,
         embed_dim=256,
         max_txt_len=32,
+        visual_encoder=None,
+        ln_vision=None,
     ):
         super().__init__(
             vit_model=vit_model,
@@ -48,14 +50,16 @@ class Blip2ITM(Blip2Qformer):
             cross_attention_freq=cross_attention_freq,
             embed_dim=embed_dim,
             max_txt_len=max_txt_len,
+            visual_encoder=visual_encoder,
+            ln_vision=ln_vision,
         )
 
-    def forward(self, samples, match_head="itm"):
+    def forward(self, samples, match_head="itm", beg_layer=None):
         image = samples["image"]
         caption = samples["text_input"]
 
         with self.maybe_autocast():
-            image_embeds = self.ln_vision(self.visual_encoder(image))
+            image_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
         image_embeds = image_embeds.float()
         image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
             image.device
@@ -73,9 +77,9 @@ class Blip2ITM(Blip2Qformer):
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
                 image.device
             )
-            attention_mask = torch.cat([query_atts, text.attention_mask], dim=1)
+            attention_mask = torch.cat([query_atts, text.attention_mask.expand(image_embeds.shape[0], -1)], dim=1)
             output_itm = self.Qformer.bert(
-                text.input_ids,
+                text.input_ids.expand(image_embeds.shape[0], -1),
                 query_embeds=query_tokens,
                 attention_mask=attention_mask,
                 encoder_hidden_states=image_embeds,

@@ -11,17 +11,20 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda.amp import autocast as autocast
 from transformers import T5TokenizerFast
+from omegaconf import OmegaConf
 
 from lavis.common.registry import registry
-from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train
+from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train, LayerNorm
+from lavis.models.blip2_models.blip2_image_text_matching import Blip2ITM
 from lavis.models.blip2_models.modeling_t5 import T5Config, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutput
 
 
-@registry.register_model("blip2_t5_instruct")
-class Blip2T5Instruct(Blip2Base):
+@registry.register_model("blip2_aio")
+class Blip2AIO(Blip2Base):
     """
     BLIP2 T5 model.
     Supported model types:
@@ -33,8 +36,7 @@ class Blip2T5Instruct(Blip2Base):
     """
 
     PRETRAINED_MODEL_CONFIG_DICT = {
-        "flant5xl": "configs/models/blip2/blip2_instruct_flant5xl.yaml",
-        "flant5xxl": "configs/models/blip2/blip2_instruct_flant5xxl.yaml",
+        "blip2_aio": "configs/models/blip2/blip2_all_in_one.yaml"
     }
 
     def __init__(
@@ -54,6 +56,8 @@ class Blip2T5Instruct(Blip2Base):
         num_few_shot_examples=0,
         few_shot_prob=0,
         qformer_text_input=True,
+        cross_attention_freq=2,
+        embed_dim=256,
     ):
         """
         apply_lemmatizer: when set to True, postprocess predict_answers() result with lemmas.
@@ -114,6 +118,25 @@ class Blip2T5Instruct(Blip2Base):
         self.few_shot_prob = few_shot_prob
 
         self.qformer_text_input = qformer_text_input
+
+        # load itm model and share the image encoder
+
+        self.ln_vision_m = LayerNorm(self.visual_encoder.num_features)
+        self.Qformer_m, self.query_tokens_m = self.init_Qformer(
+            num_query_token, self.visual_encoder.num_features, cross_attention_freq
+        )
+        self.Qformer_m.resize_token_embeddings(len(self.tokenizer))
+        state_dict = self.Qformer_m.state_dict()
+        for name, param in self.Qformer_m.named_parameters():
+            if "_query" in name:
+                key_orig = name.replace("_query", "")
+                param.data.copy_(state_dict[key_orig])
+
+        self.vision_proj = nn.Linear(self.Qformer_m.config.hidden_size, embed_dim)
+        self.text_proj = nn.Linear(self.Qformer_m.config.hidden_size, embed_dim)
+
+        self.itm_head = nn.Linear(self.Qformer_m.config.hidden_size, 2)
+        self.image_atts = None
 
     def forward(self, samples, beg_layer=None):
         # print('-----------------')
@@ -200,6 +223,72 @@ class Blip2T5Instruct(Blip2Base):
             loss = outputs.loss
 
             return {"loss": loss}
+        
+    @torch.no_grad()
+    def match(self, samples, match_head="itm", beg_layer=None):
+        image = samples["image"]
+        caption = samples["text_input"]
+
+        with self.maybe_autocast():
+            image_embeds = self.ln_vision_m(self.visual_encoder(image, beg_layer=beg_layer))
+        image_embeds = image_embeds.float()
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
+            image.device
+        )
+
+        text = self.tokenizer(
+            caption,
+            truncation=True,
+            max_length=self.max_txt_len,
+            return_tensors="pt",
+        ).to(image.device)
+
+        if match_head == "itm":
+            query_tokens_itc = self.query_tokens_m.expand(image_embeds.shape[0], -1, -1)
+            query_atts = torch.ones(query_tokens_itc.size()[:-1], dtype=torch.long).to(
+                image.device
+            )
+            attention_mask = torch.cat([query_atts, text.attention_mask.expand(image_embeds.shape[0], -1)], dim=1)
+            output_itm = self.Qformer_m.bert(
+                text.input_ids.expand(image_embeds.shape[0], -1),
+                query_embeds=query_tokens_itc,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+            itm_embeddings = output_itm.last_hidden_state[:, : query_tokens_itc.size(1), :]
+            itm_logit = self.itm_head(itm_embeddings)
+            itm_logit = itm_logit.mean(dim=1)
+
+            return itm_logit
+
+        elif match_head == "itc":
+            query_tokens_itc = self.query_tokens_m.expand(image_embeds.shape[0], -1, -1)
+
+            query_output = self.Qformer_m.bert(
+                query_embeds=query_tokens_itc,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
+            image_feats = F.normalize(
+                self.vision_proj(query_output.last_hidden_state), dim=-1
+            )
+
+            text_output = self.Qformer_m.bert(
+                text.input_ids,
+                attention_mask=text.attention_mask,
+                return_dict=True,
+            )
+            text_feat = F.normalize(
+                self.text_proj(text_output.last_hidden_state[:, 0, :]), dim=-1
+            )
+
+            sims = torch.bmm(image_feats, text_feat.unsqueeze(-1))
+            sim, _ = torch.max(sims, dim=1)
+
+            return sim
 
     def prepare_few_shot_embeds(self, samples, beg_layer=None):
         this_n_fs = random.choices(
@@ -393,6 +482,130 @@ class Blip2T5Instruct(Blip2Base):
         with self.maybe_autocast(dtype=torch.bfloat16):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
             inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
+
+            outputs = self.t5_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=encoder_atts,
+                do_sample=use_nucleus_sampling,
+                top_p=top_p,
+                temperature=temperature,
+                num_beams=num_beams,
+                max_new_tokens=max_length,
+                min_length=min_length,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                num_return_sequences=num_captions,
+            )
+            output_text = self.t5_tokenizer.batch_decode(
+                outputs, skip_special_tokens=True
+            )
+
+        return output_text
+
+
+    @torch.no_grad()
+    def generate_interleave(
+        self,
+        samples,
+        use_nucleus_sampling=False,
+        num_beams=5,
+        max_length=30,
+        min_length=1,
+        top_p=0.9,
+        repetition_penalty=1.0,
+        length_penalty=1.0,
+        num_captions=1,
+        temperature=1,
+        beg_layer=25,
+    ):
+        """
+        Args:
+            samples (dict): A dictionary containing the following keys:
+                - image (torch.Tensor): A tensor of shape (batch_size, 3, H, W)
+            use_nucleus_sampling (bool): Whether to use nucleus sampling. If False, use top-k sampling.
+            num_beams (int): Number of beams for beam search. 1 means no beam search.
+            max_length (int): The maximum length of the sequence to be generated.
+            min_length (int): The minimum length of the sequence to be generated.
+            top_p (float): The cumulative probability for nucleus sampling.
+            repetition_penalty (float): The parameter for repetition penalty. 1.0 means no penalty.
+            num_captions (int): Number of captions to be generated for each image.
+        Returns:
+            captions (list): A list of strings of length batch_size * num_captions.
+        """
+        batch=1
+        device=self.device
+        seq = samples["seq"]
+
+        encoder_atts = None
+        inputs_embeds = None
+
+        for i in seq:
+
+            # if it's a strign
+            if isinstance(i, str):
+                
+                prompt = [i] * batch
+
+                input_tokens = self.t5_tokenizer(
+                    prompt, padding="longest", return_tensors="pt"
+                ).to(device)
+
+                token_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
+
+                inputs_embeds = token_embeds if inputs_embeds is None else torch.cat((inputs_embeds, token_embeds), dim=1)
+                encoder_atts = input_tokens.attention_mask if encoder_atts is None else torch.cat((encoder_atts, input_tokens.attention_mask), dim=1)
+
+            else:
+                if isinstance(i, dict):
+                    q = i['query']
+                    i = i['image']
+                    qformer_text_input = True
+                else:
+                    qformer_text_input = False
+
+                with self.maybe_autocast():
+                    image_embeds = self.ln_vision(self.visual_encoder(i, beg_layer=beg_layer))
+                image_embeds = image_embeds.float()
+                
+                if self.image_atts is None:
+                    self.image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long, requires_grad=False).to(device)
+
+                query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+
+                if qformer_text_input:
+                    text_Qformer = self.tokenizer(
+                        q,
+                        padding='longest',
+                        truncation=True,
+                        max_length=self.max_txt_len,
+                        return_tensors="pt",
+                    ).to(device)
+                    query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(device)
+                    Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
+
+                    query_output = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=image_embeds,
+                        encoder_attention_mask=self.image_atts,
+                        return_dict=True,
+                    )
+                else:
+                    query_output = self.Qformer.bert(
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=image_embeds,
+                        encoder_attention_mask=self.image_atts,
+                        return_dict=True,
+                    )
+
+                inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+                atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long, requires_grad=False).to(device)
+
+                inputs_embeds = inputs_t5 if inputs_embeds is None else torch.cat((inputs_embeds, inputs_t5), dim=1)
+                encoder_atts = atts_t5 if encoder_atts is None else torch.cat((encoder_atts, atts_t5), dim=1)
+
+        with self.maybe_autocast(dtype=torch.bfloat16):
 
             outputs = self.t5_model.generate(
                 inputs_embeds=inputs_embeds,
@@ -757,6 +970,9 @@ class Blip2T5Instruct(Blip2Base):
 
         qformer_text_input = cfg.get("qformer_text_input", True)
 
+        cross_attention_freq = cfg.get("cross_attention_freq", 2)
+
+
         model = cls(
             vit_model=vit_model,
             img_size=img_size,
@@ -773,6 +989,7 @@ class Blip2T5Instruct(Blip2Base):
             num_few_shot_examples=num_few_shot_examples,
             few_shot_prob=few_shot_prob,
             qformer_text_input=qformer_text_input,
+            cross_attention_freq = cross_attention_freq,
         )
 
         # if qformer_text_input:
@@ -782,5 +999,13 @@ class Blip2T5Instruct(Blip2Base):
         #     )
 
         model.load_checkpoint_from_config(cfg)
+
+        itm_model_type = cfg.get("itm_model_type", "pretrain")
+        
+        cfg_itm = OmegaConf.load(registry.get_model_class("blip2_image_text_matching").default_config_path(itm_model_type)).model
+        model.load_checkpoint_from_config(
+            cfg_itm, 
+            load=['Qformer','query_tokens','vision_proj','text_proj','itm_head','ln_vision'], 
+            remap=['Qformer_m','query_tokens_m','vision_proj','text_proj','itm_head', 'ln_vision_m'])
 
         return model

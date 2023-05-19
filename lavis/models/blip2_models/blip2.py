@@ -82,7 +82,7 @@ class Blip2Base(BaseModel):
         self.vit_name = model_name
         return visual_encoder, ln_vision
 
-    def load_from_pretrained(self, url_or_filename):
+    def load_from_pretrained(self, url_or_filename, **kwargs):
         if is_url(url_or_filename):
             cached_file = download_cached_file(
                 url_or_filename, check_hash=False, progress=True
@@ -94,6 +94,20 @@ class Blip2Base(BaseModel):
             raise RuntimeError("checkpoint url or path is invalid")
 
         state_dict = checkpoint["model"]
+        
+        if "load" in kwargs.keys():
+            new_state_dict = {}
+
+            if not "remap" in kwargs.keys():
+                kwargs['remap'] = kwargs["load"]
+
+            for dst,src in zip(kwargs["remap"], kwargs["load"]):
+                for layer in state_dict.keys():
+                    if src in layer:
+                        new_name = layer.replace(src, dst)
+                        new_state_dict[new_name] = state_dict[layer]
+
+            state_dict = new_state_dict
 
         msg = self.load_state_dict(state_dict, strict=False)
 
