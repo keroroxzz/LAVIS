@@ -414,8 +414,10 @@ class Blip2AIO(Blip2Base):
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
             Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
 
+        dim_offset = 0 if beg_layer is None else 1
+
         # For video data
-        if image.dim() == 5:
+        if image.dim() == 5-dim_offset:
             inputs_t5, atts_t5 = [], []
             for j in range(image.size(2)):
                 this_frame = image[:,:,j,:,:]
