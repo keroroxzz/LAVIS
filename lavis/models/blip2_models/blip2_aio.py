@@ -681,6 +681,7 @@ class Blip2AIO(Blip2Base):
         samples,
         candidates,
         n_segments=1,
+        beg_layer=None,
     ):
         # If candidates is a list of lists, each sample has its candidates, then we need to iterate one by one
         if type(candidates[0]) == list:
@@ -704,7 +705,7 @@ class Blip2AIO(Blip2Base):
                 if 'caption' in samples.keys():
                     this_sample['caption'] = [samples["caption"][i]]
 
-                this_result = self._predict_class(this_sample, candidates[i], n_segments)
+                this_result = self._predict_class(this_sample, candidates[i], n_segments, beg_layer=beg_layer)
                 results.append(this_result)
 
             try:
@@ -714,7 +715,7 @@ class Blip2AIO(Blip2Base):
 
             return results
 
-        return self._predict_class(samples, candidates, n_segments)
+        return self._predict_class(samples, candidates, n_segments, beg_layer=beg_layer)
 
     def _predict_class(
         self,
@@ -775,7 +776,9 @@ class Blip2AIO(Blip2Base):
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
             Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask], dim=1)
 
-        if image.dim() == 5:
+        dim_offset = 0 if beg_layer is None else 1
+
+        if image.dim() == 5-dim_offset:
             inputs_t5, atts_t5 = [], []
             for j in range(image.size(2)):
                 this_frame = image[:,:,j,:,:]
@@ -857,7 +860,6 @@ class Blip2AIO(Blip2Base):
                 if n == (n_segments - 1):
                     seg_len = n_cands - seg_len * (n_segments - 1)
 
-                # this_encoder_outputs = copy.deepcopy(encoder_outputs)
                 this_encoder_outputs = BaseModelOutput(
                     last_hidden_state=encoder_outputs[0].clone(),
                 )
@@ -910,7 +912,7 @@ class Blip2AIO(Blip2Base):
             # loss = loss.reshape(bs, n_cands)
             # output_class_ranks = torch.argsort(loss, dim=-1) # (bs, num_candidates)
 
-        return output_class_ranks
+        return all_losses, output_class_ranks
 
     def _lemmatize(self, answers):
         def apply(answer):
