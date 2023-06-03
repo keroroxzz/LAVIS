@@ -602,6 +602,9 @@ class Blip2AIO(Blip2Base):
             with self.maybe_autocast():
                 image_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            
+            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
+            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask],dim=1)
 
             if self.qformer_text_input:
                 query_output = self.Qformer.bert(
@@ -1076,7 +1079,7 @@ class Blip2AIO(Blip2Base):
         beg_layer=None,
     ):
         # If candidates is a list of lists, each sample has its candidates, then we need to iterate one by one
-        if type(candidates[0]) == list:
+        if type(candidates[0]) == list and "image" in samples.keys():
             results = []
 
             for i in range(samples["image"].size(0)):
@@ -1130,126 +1133,136 @@ class Blip2AIO(Blip2Base):
             output_class: predicted class index
         """
 
-        image = samples["image"]
+        image = None
         prompt = samples["prompt"]
+        inputs_t5 = None
+        atts_t5 = None
 
-        bs = image.size(0)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        if isinstance(prompt, str):
-            prompt = [prompt] * bs
-        else:
-            assert len(prompt) == bs, "The number of prompts must be equal to the batch size."
+        if "image" in samples.keys():
+            image = samples["image"]
+            device = image.device
+            bs = image.size(0)
 
-        if "text_input" in samples.keys():
-            if type(samples["text_input"][0]) == list:
-                prompt = [prompt[i].format(*samples["text_input"][i]) for i in range(len(prompt))]
+            if isinstance(prompt, str):
+                prompt = [prompt] * bs
             else:
-                prompt = [prompt[i].format(samples["text_input"][i]) for i in range(len(prompt))]
+                assert len(prompt) == bs, "The number of prompts must be equal to the batch size."
 
-        # scienceqa
-        if 'context' in samples.keys() and samples['context'] != '':
-            prompt = [f'context: {samples["context"][i]}. {prompt[i]}' for i in range(len(prompt))]
+            if "text_input" in samples.keys():
+                if type(samples["text_input"][0]) == list:
+                    prompt = [prompt[i].format(*samples["text_input"][i]) for i in range(len(prompt))]
+                else:
+                    prompt = [prompt[i].format(samples["text_input"][i]) for i in range(len(prompt))]
 
-        # visual dialog
-        if 'history' in samples.keys() and samples['history'][0] != '':
-            prompt = [f'dialog history: {samples["history"][i]}\n{prompt[i]}' for i in range(len(prompt))]
+            # scienceqa
+            if 'context' in samples.keys() and samples['context'] != '':
+                prompt = [f'context: {samples["context"][i]}. {prompt[i]}' for i in range(len(prompt))]
 
-        if 'caption' in samples.keys() and samples['caption'][0] != '':
-            prompt = [f'This image has the caption "{samples["caption"][i]}". {prompt[i]}' for i in range(len(prompt))]
+            # visual dialog
+            if 'history' in samples.keys() and samples['history'][0] != '':
+                prompt = [f'dialog history: {samples["history"][i]}\n{prompt[i]}' for i in range(len(prompt))]
 
-        query_tokens = self.query_tokens.expand(bs, -1, -1)
-        if self.qformer_text_input:
-            text_Qformer = self.tokenizer(
-                prompt,
-                padding='longest',
-                truncation=True,
-                max_length=self.max_txt_len,
-                return_tensors="pt"
-            ).to(image.device)
-            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask], dim=1)
+            if 'caption' in samples.keys() and samples['caption'][0] != '':
+                prompt = [f'This image has the caption "{samples["caption"][i]}". {prompt[i]}' for i in range(len(prompt))]
 
-        dim_offset = 0 if beg_layer is None else 1
-        dim = image.dim()
-
-        if dim == 5-dim_offset:
-            
-            if dim == 5:
-                B, T, C, H, W = image.size()
-                image = image.reshape(-1, C, H, W)
-
-            elif dim == 4 and beg_layer is not None:
-                B, T, L, E = image.size()
-                image = image.reshape(-1, L, E)
-
-            with self.maybe_autocast():
-                img_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
-                img_atts = torch.ones(img_embeds.size()[:-1], dtype=torch.long).to(image.device)
-            
-            query_tokens = self.query_tokens.expand(B*T, -1, -1)
-            query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(image.device)
-            Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask.expand(B*T, -1)],dim=1)
-
+            query_tokens = self.query_tokens.expand(bs, -1, -1)
             if self.qformer_text_input:
-                frame_query_output = self.Qformer.bert(
-                    text_Qformer.input_ids.expand(B*T, -1),
-                    attention_mask = Qformer_atts,
-                    query_embeds=query_tokens,
-                    encoder_hidden_states=img_embeds,
-                    encoder_attention_mask=img_atts,
-                    return_dict=True,
-                )
-            else:
-                frame_query_output = self.Qformer.bert(
-                    query_embeds=query_tokens,
-                    encoder_hidden_states=img_embeds,
-                    encoder_attention_mask=img_atts,
-                    return_dict=True,
-                )
+                text_Qformer = self.tokenizer(
+                    prompt,
+                    padding='longest',
+                    truncation=True,
+                    max_length=self.max_txt_len,
+                    return_tensors="pt"
+                ).to(device)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(device)
+                Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask], dim=1)
 
-            inputs_t5 = self.t5_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
-            inputs_t5 = inputs_t5.reshape(B, -1, inputs_t5.size(-1))
-            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+            dim_offset = 0 if beg_layer is None else 1
+            dim = image.dim()
+
+            if dim == 5-dim_offset:
+                
+                if dim == 5:
+                    B, T, C, H, W = image.size()
+                    image = image.reshape(-1, C, H, W)
+
+                elif dim == 4 and beg_layer is not None:
+                    B, T, L, E = image.size()
+                    image = image.reshape(-1, L, E)
+
+                with self.maybe_autocast():
+                    img_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
+                    img_atts = torch.ones(img_embeds.size()[:-1], dtype=torch.long).to(device)
+                
+                query_tokens = self.query_tokens.expand(B*T, -1, -1)
+                query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(device)
+                Qformer_atts = torch.cat([query_atts,text_Qformer.attention_mask.expand(B*T, -1)],dim=1)
+
+                if self.qformer_text_input:
+                    frame_query_output = self.Qformer.bert(
+                        text_Qformer.input_ids.expand(B*T, -1),
+                        attention_mask = Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=img_embeds,
+                        encoder_attention_mask=img_atts,
+                        return_dict=True,
+                    )
+                else:
+                    frame_query_output = self.Qformer.bert(
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=img_embeds,
+                        encoder_attention_mask=img_atts,
+                        return_dict=True,
+                    )
+
+                inputs_t5 = self.t5_proj(frame_query_output.last_hidden_state[:,:query_tokens.size(1),:])
+                inputs_t5 = inputs_t5.reshape(B, -1, inputs_t5.size(-1))
+                atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
+
+            else:
+                with self.maybe_autocast():
+                    image_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
+                image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
+
+                if self.qformer_text_input:
+                    query_output = self.Qformer.bert(
+                        text_Qformer.input_ids,
+                        attention_mask=Qformer_atts,
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=image_embeds,
+                        encoder_attention_mask=image_atts,
+                        return_dict=True,
+                    )
+                else:
+                    query_output = self.Qformer.bert(
+                        query_embeds=query_tokens,
+                        encoder_hidden_states=image_embeds,
+                        encoder_attention_mask=image_atts,
+                        return_dict=True,
+                    )
+
+                inputs_t5 = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
+                atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(device)
 
         else:
-            with self.maybe_autocast():
-                image_embeds = self.ln_vision(self.visual_encoder(image, beg_layer=beg_layer))
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
-
-            if self.qformer_text_input:
-                query_output = self.Qformer.bert(
-                    text_Qformer.input_ids,
-                    attention_mask=Qformer_atts,
-                    query_embeds=query_tokens,
-                    encoder_hidden_states=image_embeds,
-                    encoder_attention_mask=image_atts,
-                    return_dict=True,
-                )
-            else:
-                query_output = self.Qformer.bert(
-                    query_embeds=query_tokens,
-                    encoder_hidden_states=image_embeds,
-                    encoder_attention_mask=image_atts,
-                    return_dict=True,
-                )
-
-            inputs_t5 = self.t5_proj(query_output.last_hidden_state[:,:query_tokens.size(1),:])
-            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+            bs = 1
 
         input_tokens = self.t5_tokenizer(
             prompt, padding="longest", return_tensors="pt"
-        ).to(image.device)
+        ).to(device)
         output_tokens = self.t5_tokenizer(
             candidates, padding="longest", return_tensors="pt"
-        ).to(image.device)
+        ).to(device)
 
-        encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
 
         n_cands = len(candidates)
 
         with self.maybe_autocast(dtype=torch.bfloat16):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
-            inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
+            inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1) if inputs_t5 is not None else inputs_embeds
+            encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1) if atts_t5 is not None else input_tokens.attention_mask
 
             encoder_outputs = self.t5_model.encoder(
                 inputs_embeds=inputs_embeds,
@@ -1287,32 +1300,10 @@ class Blip2AIO(Blip2Base):
                 loss = outputs.loss
 
                 loss = loss.reshape(bs, seg_len)
-                # output_class_ranks = torch.argsort(loss, dim=-1)
                 all_losses.append(loss)
 
             all_losses = torch.cat(all_losses, dim=-1)
             output_class_ranks = torch.argsort(all_losses, dim=-1)
-
-            # encoder_outputs['last_hidden_state'] = encoder_outputs[0].repeat_interleave(n_cands, dim=0)
-            # encoder_atts = encoder_atts.repeat_interleave(n_cands, dim=0)
-            # output_tokens.input_ids = output_tokens.input_ids.repeat(bs, 1)
-            # output_tokens.attention_mask = output_tokens.attention_mask.repeat(bs, 1)
-
-            # # compute the LM loss for each candidate (sum logprob across all tokens) and select the highest
-            # targets = output_tokens.input_ids.masked_fill(output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100)
-
-            # outputs = self.t5_model(
-            #     encoder_outputs=encoder_outputs,
-            #     attention_mask=encoder_atts,
-            #     decoder_attention_mask=output_tokens.attention_mask,
-            #     return_dict=True,
-            #     labels=targets,
-            #     reduction="none",
-            # )
-            # loss = outputs.loss
-
-            # loss = loss.reshape(bs, n_cands)
-            # output_class_ranks = torch.argsort(loss, dim=-1) # (bs, num_candidates)
 
         return all_losses, output_class_ranks
 

@@ -251,7 +251,8 @@ class BertSelfAttention(nn.Module):
 
         if is_cross_attention and self.save_attention:
             self.save_attention_map(attention_probs)
-            attention_probs.register_hook(self.save_attn_gradients)
+            if attention_probs.requires_grad:
+                attention_probs.register_hook(self.save_attn_gradients)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
