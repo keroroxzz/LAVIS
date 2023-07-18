@@ -1306,6 +1306,22 @@ class Blip2AIO(Blip2Base):
             output_class_ranks = torch.argsort(all_losses, dim=-1)
 
         return all_losses, output_class_ranks
+    
+    def MatchImage(self, img_tensor, description, beg_layer=25, n_segments=1):
+        """
+        Match the image with LLM
+        """
+
+        pred_match = -self.predict_class(
+            {"image":img_tensor, "prompt":f"Is this {description}?"}, 
+            ["Yes", "No"], 
+            n_segments=n_segments, 
+            beg_layer=beg_layer)[0].cpu()
+        
+        pred_match -= pred_match.mean(dim=1, keepdim=True)
+        pred_match = pred_match.softmax(dim=1)[:,0]
+
+        return pred_match
 
     def _lemmatize(self, answers):
         def apply(answer):
